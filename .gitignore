@@ -1,0 +1,8 @@
+# Build output (создаётся build.sh)
+build/
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+DerivedData/
+.DS_Store
