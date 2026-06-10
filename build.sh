@@ -59,8 +59,20 @@ PLIST
 
 echo "APPL????" > "${APP}/Contents/PkgInfo"
 
-echo "==> Ad-hoc подпись (нужна для автозапуска через SMAppService)"
-codesign --force --sign - --identifier "$BUNDLE_ID" "$APP"
+# Подпись: по умолчанию ad-hoc (-).
+# Для переноса на другие Mac без предупреждений Gatekeeper укажите Developer ID:
+#   SIGN_IDENTITY="Developer ID Application: Имя (TEAMID)" ./build.sh
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+
+if [ "$SIGN_IDENTITY" = "-" ]; then
+    echo "==> Ad-hoc подпись (для запуска на этой машине; автозапуск через SMAppService)"
+    codesign --force --sign - --identifier "$BUNDLE_ID" "$APP"
+else
+    echo "==> Подпись Developer ID + hardened runtime: $SIGN_IDENTITY"
+    codesign --force --options runtime --timestamp \
+        --sign "$SIGN_IDENTITY" --identifier "$BUNDLE_ID" "$APP"
+    echo "    Для нотаризации: см. SIGNING.md"
+fi
 
 echo "==> Готово: $APP"
 

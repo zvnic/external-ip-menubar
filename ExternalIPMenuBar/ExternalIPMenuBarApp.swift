@@ -9,6 +9,7 @@ import SwiftUI
 import AppKit
 import Network
 import ServiceManagement
+import Darwin
 
 @main
 struct ExternalIPMenuBarApp: App {
@@ -21,10 +22,23 @@ struct ExternalIPMenuBarApp: App {
     }
 }
 
+/// Результат запроса внешнего IP вместе с геоданными (если их удалось получить).
+struct IPInfo {
+    let ip: String
+    var country: String?
+    var countryCode: String?
+    var flag: String?
+    var isp: String?
+
+    var isIPv6: Bool { ip.contains(":") }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var timer: Timer?
     private var ipMenuItem: NSMenuItem?
+    private var geoMenuItem: NSMenuItem?
+    private var netMenuItem: NSMenuItem?
     private var updatedMenuItem: NSMenuItem?
     private var copyMenuItem: NSMenuItem?
     private var loginMenuItem: NSMenuItem?
@@ -33,6 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let monitorQueue = DispatchQueue(label: "zvnic.ExternalIPMenuBar.network")
 
     private var currentIP: String?
+    private var lastInterfaceType: NWInterface.InterfaceType?
     private var refreshTask: Task<Void, Never>?
     private var debounceWorkItem: DispatchWorkItem?
 
@@ -89,6 +104,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ipMenuItem?.target = self
         menu.addItem(ipMenuItem!)
 
+        geoMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        geoMenuItem?.isEnabled = false
+        geoMenuItem?.isHidden = true
+        menu.addItem(geoMenuItem!)
+
+        netMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        netMenuItem?.isEnabled = false
+        netMenuItem?.isHidden = true
+        menu.addItem(netMenuItem!)
+
         updatedMenuItem = NSMenuItem(title: "Обновлено: —", action: nil, keyEquivalent: "")
         updatedMenuItem?.isEnabled = false
         menu.addItem(updatedMenuItem!)
@@ -123,6 +148,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        let authorItem = NSMenuItem(title: "Автор — @zvnic", action: nil, keyEquivalent: "")
+        authorItem.isEnabled = false
+        menu.addItem(authorItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         let quitItem = NSMenuItem(
             title: "Выход",
             action: #selector(quit),
@@ -142,8 +173,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pathMonitor.pathUpdateHandler = { [weak self] path in
             guard let self else { return }
 
+            let type = Self.primaryInterfaceType(path)
+
             // Дебаунс: при переключении сети приходит несколько событий подряд.
             DispatchQueue.main.async {
+                self.lastInterfaceType = type
                 self.debounceWorkItem?.cancel()
 
                 let work = DispatchWorkItem { [weak self] in
@@ -162,6 +196,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pathMonitor.start(queue: monitorQueue)
     }
 
+    private static func primaryInterfaceType(_ path: NWPath) -> NWInterface.InterfaceType? {
+        for type in [NWInterface.InterfaceType.wifi, .wiredEthernet, .cellular, .other, .loopback] {
+            if path.usesInterfaceType(type) {
+                return type
+            }
+        }
+        return nil
+    }
+
     // MARK: - Refresh
 
     @objc private func refresh_ip() {
@@ -174,34 +217,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         refreshTask?.cancel()
         refreshTask = Task { [weak self] in
-            let ip = await Self.fetch_external_ip()
+            let info = await Self.fetch_ip_info()
             guard !Task.isCancelled else { return }
-            await self?.applyResult(ip)
+            await self?.applyResult(info)
         }
     }
 
     @MainActor
-    private func applyResult(_ ip: String?) {
-        guard let ip else {
+    private func applyResult(_ info: IPInfo?) {
+        guard let info else {
             showNoNetwork()
             return
         }
 
-        currentIP = ip
+        currentIP = info.ip
+
+        let vpnActive = Self.isVPNActive()
+
+        // Геострока: 🇩🇪 Германия — Deutsche Telekom
+        if info.country != nil || info.isp != nil {
+            let flag = info.flag.map { "\($0) " } ?? ""
+            let country = info.country ?? info.countryCode ?? ""
+            let isp = info.isp.map { country.isEmpty ? $0 : " — \($0)" } ?? ""
+            geoMenuItem?.title = "\(flag)\(country)\(isp)"
+            geoMenuItem?.isHidden = false
+        } else {
+            geoMenuItem?.isHidden = true
+        }
+
+        // Сетевая строка: Сеть: Wi-Fi · VPN: активен
+        var netParts = ["Сеть: \(networkTypeName(lastInterfaceType))"]
+        if vpnActive {
+            netParts.append("VPN: активен")
+        }
+        if info.isIPv6 {
+            netParts.append("IPv6")
+        }
+        netMenuItem?.title = netParts.joined(separator: " · ")
+        netMenuItem?.isHidden = false
+
+        updatedMenuItem?.title = "Обновлено: \(timeFormatter.string(from: Date()))"
+        ipMenuItem?.title = "IP: \(info.ip)"
+
+        // Иконка в статус-баре: при VPN — щит, иначе сеть.
+        var tooltipLines = ["External IP: \(info.ip)"]
+        if let geo = geoMenuItem?.title, geoMenuItem?.isHidden == false {
+            tooltipLines.append(geo)
+        }
+        tooltipLines.append(netMenuItem?.title ?? "")
 
         set_status_icon(
-            systemName: "network",
-            color: .systemGreen,
-            tooltip: "External IP: \(ip)",
-            title: " \(ip)"
+            systemName: vpnActive ? "lock.shield" : "network",
+            color: vpnActive ? .systemBlue : .systemGreen,
+            tooltip: tooltipLines.joined(separator: "\n"),
+            title: " \(info.ip)"
         )
+    }
 
-        ipMenuItem?.title = "IP: \(ip)"
-        updatedMenuItem?.title = "Обновлено: \(timeFormatter.string(from: Date()))"
+    private func networkTypeName(_ type: NWInterface.InterfaceType?) -> String {
+        switch type {
+        case .wifi: return "Wi-Fi"
+        case .wiredEthernet: return "Ethernet"
+        case .cellular: return "Сотовая"
+        case .loopback: return "loopback"
+        case .other: return "прочая"
+        default: return "неизвестно"
+        }
     }
 
     private func showNoNetwork() {
         currentIP = nil
+        geoMenuItem?.isHidden = true
+        netMenuItem?.isHidden = true
         set_status_icon(
             systemName: "wifi.exclamationmark",
             color: .systemRed,
@@ -212,52 +299,128 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updatedMenuItem?.title = "Обновлено: \(timeFormatter.string(from: Date()))"
     }
 
-    private static func fetch_external_ip() async -> String? {
+    // MARK: - Fetching
+
+    private struct IPWhoResponse: Decodable {
+        let ip: String?
+        let success: Bool?
+        let country: String?
+        let country_code: String?
+        let connection: Connection?
+        let flag: Flag?
+
+        struct Connection: Decodable { let isp: String?; let org: String? }
+        struct Flag: Decodable { let emoji: String? }
+    }
+
+    private static func fetch_ip_info() async -> IPInfo? {
+        // 1. ipwho.is отдаёт IP + страну + провайдера + флаг одним HTTPS-запросом.
+        if let info = await fetch_from_ipwhois() {
+            return info
+        }
+
+        // 2. Резерв: быстрые провайдеры, отдающие только сам IP (без гео).
+        if let ip = await fetch_plain_ip() {
+            return IPInfo(ip: ip)
+        }
+
+        return nil
+    }
+
+    private static func fetch_from_ipwhois() async -> IPInfo? {
+        guard let url = URL(string: "https://ipwho.is/") else { return nil }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 5
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let decoded = try JSONDecoder().decode(IPWhoResponse.self, from: data)
+
+            guard decoded.success == true,
+                  let ip = decoded.ip,
+                  is_valid_ip(ip)
+            else {
+                return nil
+            }
+
+            return IPInfo(
+                ip: ip,
+                country: decoded.country,
+                countryCode: decoded.country_code,
+                flag: decoded.flag?.emoji,
+                isp: decoded.connection?.isp ?? decoded.connection?.org
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    private static func fetch_plain_ip() async -> String? {
         let urls = [
-            "https://api.ipify.org",
+            "https://api64.ipify.org",   // вернёт IPv4 или IPv6 в зависимости от подключения
             "https://ifconfig.me/ip",
             "https://icanhazip.com"
         ]
 
         for url_string in urls {
-            guard let url = URL(string: url_string) else {
-                continue
-            }
-
+            guard let url = URL(string: url_string) else { continue }
             do {
                 var request = URLRequest(url: url)
                 request.timeoutInterval = 5
                 request.cachePolicy = .reloadIgnoringLocalCacheData
 
                 let (data, _) = try await URLSession.shared.data(for: request)
-
                 guard let ip = String(data: data, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines),
                       is_valid_ip(ip)
                 else {
                     continue
                 }
-
                 return ip
             } catch {
                 continue
             }
         }
-
         return nil
     }
 
+    /// Валидация IPv4 и IPv6 через системный inet_pton.
     private static func is_valid_ip(_ value: String) -> Bool {
-        let pattern = #"^(\d{1,3}\.){3}\d{1,3}$"#
-
-        guard value.range(of: pattern, options: .regularExpression) != nil else {
-            return false
+        var buf4 = in_addr()
+        if value.withCString({ inet_pton(AF_INET, $0, &buf4) }) == 1 {
+            return true
         }
+        var buf6 = in6_addr()
+        if value.withCString({ inet_pton(AF_INET6, $0, &buf6) }) == 1 {
+            return true
+        }
+        return false
+    }
 
-        return value
-            .split(separator: ".")
-            .compactMap { Int($0) }
-            .allSatisfy { $0 >= 0 && $0 <= 255 }
+    /// Эвристика наличия VPN: ищем поднятый туннельный интерфейс с назначенным адресом.
+    /// Учитывает utun/ppp/ipsec/tap/tun. Может срабатывать и на iCloud Private Relay.
+    private static func isVPNActive() -> Bool {
+        var addrs: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addrs) == 0 else { return false }
+        defer { freeifaddrs(addrs) }
+
+        let tunnelPrefixes = ["utun", "ppp", "ipsec", "tap", "tun"]
+        var ptr = addrs
+        while let current = ptr {
+            let name = String(cString: current.pointee.ifa_name)
+            let flags = Int32(current.pointee.ifa_flags)
+            let family = current.pointee.ifa_addr?.pointee.sa_family
+
+            let isUp = (flags & Int32(IFF_UP)) != 0
+            let hasIPv4 = family == sa_family_t(AF_INET)
+
+            if isUp, hasIPv4, tunnelPrefixes.contains(where: { name.hasPrefix($0) }) {
+                return true
+            }
+            ptr = current.pointee.ifa_next
+        }
+        return false
     }
 
     // MARK: - Actions
