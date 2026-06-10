@@ -60,6 +60,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Запрет дубликатов: если копия с тем же bundle id уже запущена
+        // (другой путь, автозапуск + ручной старт и т.п.) — выходим.
+        if isAnotherInstanceRunning() {
+            NSApp.terminate(nil)
+            return
+        }
+
         NSApp.setActivationPolicy(.accessory)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -83,6 +90,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             userInfo: nil,
             repeats: true
         )
+    }
+
+    private func isAnotherInstanceRunning() -> Bool {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return false }
+        let others = NSRunningApplication
+            .runningApplications(withBundleIdentifier: bundleID)
+            .filter { $0 != NSRunningApplication.current }
+        return !others.isEmpty
     }
 
     func applicationWillTerminate(_ notification: Notification) {
